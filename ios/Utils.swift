@@ -1,0 +1,722 @@
+// MARK: - Helper Methods
+import Foundation
+import Security
+import LocalAuthentication
+import MachO
+import React
+import UIKit
+
+/**
+ * Determines the appropriate signature algorithm based on key type
+ * - Parameter keyRef: The SecKey reference
+ * - Returns: The appropriate SecKeyAlgorithm for the key type
+ */
+public func getSignatureAlgorithm(for keyRef: SecKey) -> SecKeyAlgorithm {
+  let keyAttributes = SecKeyCopyAttributes(keyRef) as? [String: Any] ?? [:]
+  let keyType = keyAttributes[kSecAttrKeyType as String] as? String ?? "Unknown"
+
+  return keyType == kSecAttrKeyTypeRSA as String
+    ? .rsaSignatureMessagePKCS1v15SHA256
+    : .ecdsaSignatureMessageX962SHA256
+}
+
+/**
+ * Result of resolving a requested signature algorithm name against a key
+ */
+public enum SignatureAlgorithmResolution {
+  case algorithm(SecKeyAlgorithm)
+  case invalid(message: String)
+}
+
+/**
+ * Resolves the SecKeyAlgorithm for a key from an optional requested algorithm
+ * name (SHA256withRSA / SHA512withRSA / SHA256withECDSA / SHA512withECDSA).
+ * Falls back to the SHA-256 default for the key type when nothing is requested.
+ */
+public func resolveSignatureAlgorithm(for keyRef: SecKey, requested: String?) -> SignatureAlgorithmResolution {
+  guard let requested = requested else {
+    return .algorithm(getSignatureAlgorithm(for: keyRef))
+  }
+
+  let keyAttributes = SecKeyCopyAttributes(keyRef) as? [String: Any] ?? [:]
+  let isRSA = (keyAttributes[kSecAttrKeyType as String] as? String ?? "") == kSecAttrKeyTypeRSA as String
+
+  switch (requested, isRSA) {
+  case ("SHA256withRSA", true):
+    return .algorithm(.rsaSignatureMessagePKCS1v15SHA256)
+  case ("SHA512withRSA", true):
+    return .algorithm(.rsaSignatureMessagePKCS1v15SHA512)
+  case ("SHA256withECDSA", false):
+    return .algorithm(.ecdsaSignatureMessageX962SHA256)
+  case ("SHA512withECDSA", false):
+    return .algorithm(.ecdsaSignatureMessageX962SHA512)
+  case ("SHA256withRSA", false), ("SHA512withRSA", false),
+       ("SHA256withECDSA", true), ("SHA512withECDSA", true):
+    return .invalid(message: "Algorithm \(requested) does not match the key type")
+  default:
+    return .invalid(message: "Unsupported algorithm: \(requested). Supported: SHA256withRSA, SHA512withRSA, SHA256withECDSA, SHA512withECDSA")
+  }
+}
+
+/**
+ * Performs biometric authentication with consistent error handling
+ * - Parameters:
+ *   - reason: The localized reason for authentication
+ *   - completion: Completion handler with success status and optional error
+ */
+public func performBiometricAuthentication(
+  reason: String,
+  completion: @escaping (Bool, Error?) -> Void
+) {
+  let context = LAContext()
+  context.localizedFallbackTitle = ""
+
+  var authError: NSError?
+  guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError) else {
+    if let laError = authError as? LAError {
+      completion(false, ReactNativeBiometricsError.fromLAError(laError))
+    } else {
+      completion(false, ReactNativeBiometricsError.biometryNotAvailable)
+    }
+    return
+  }
+
+  context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason, reply: completion)
+}
+
+/**
+ * Handles errors by rejecting the promise with proper error information
+ * - Parameters:
+ *   - error: The ReactNativeBiometricsError to handle
+ *   - reject: The RCT promise reject block
+ */
+public func handleError(
+  _ error: ReactNativeBiometricsError,
+  reject: RCTPromiseRejectBlock
+) {
+  let errorInfo = error.errorInfo
+  ReactNativeBiometricDebug.debugLog("Error: \(errorInfo.code) - \(errorInfo.message)")
+  reject(errorInfo.code, errorInfo.message, error)
+}
+
+/**
+ * Handles errors by resolving the promise with error information in the result
+ * - Parameters:
+ *   - error: The ReactNativeBiometricsError to handle
+ *   - resolve: The RCT promise resolve block
+ */
+public func handleErrorWithResult(
+  _ error: ReactNativeBiometricsError,
+  resolve: @escaping RCTPromiseResolveBlock
+) {
+  let errorInfo = error.errorInfo
+  ReactNativeBiometricDebug.debugLog("Error: \(errorInfo.code) - \(errorInfo.message)")
+  resolve([
+    "success": false,
+    "error": errorInfo.message,
+    "errorCode": errorInfo.code
+  ])
+}
+
+/**
+ * Generates a key alias based on custom alias or configured default
+ * - Parameter customAlias: Optional custom alias to use
+ * - Parameter configuredAlias: The configured default alias from UserDefaults
+ * - Returns: The key alias to use
+ */
+public func generateKeyAlias(customAlias: String? = nil, configuredAlias: String? = nil) -> String {
+  if let customAlias = customAlias {
+    return customAlias
+  }
+
+  if let configuredAlias = configuredAlias {
+    return configuredAlias
+  }
+
+  // Generate app-specific default key alias
+  let bundleId = Bundle.main.bundleIdentifier ?? "unknown"
+  return "\(bundleId).ReactNativeBiometricsKey"
+}
+
+/**
+ * Creates a keychain query for finding keys
+ * - Parameters:
+ *   - keyTag: The key tag to search for
+ *   - includeSecureEnclave: Whether to include Secure Enclave token in query
+ *   - returnRef: Whether to return the key reference
+ *   - returnAttributes: Whether to return key attributes
+ * - Returns: The keychain query dictionary
+ */
+public func createKeychainQuery(
+  keyTag: String,
+  includeSecureEnclave: Bool = true,
+  promptTitle: NSString? = nil,
+  cancelButtonText: NSString? = nil,
+  returnRef: Bool = false,
+  returnAttributes: Bool = false
+) -> [String: Any] {
+  guard let keyTagData = keyTag.data(using: .utf8) else {
+    return [:]
+  }
+
+  var query: [String: Any] = [
+    kSecClass as String: kSecClassKey,
+    kSecAttrApplicationTag as String: keyTagData
+  ]
+
+  #if !targetEnvironment(simulator)
+  if includeSecureEnclave {
+    query[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+  }
+  #endif
+
+  if let promptTitle = promptTitle as? String {
+    let context = LAContext()
+    context.localizedReason = promptTitle
+    if let cancelTitle = cancelButtonText as? String {
+      context.localizedCancelTitle = cancelTitle
+    }
+    query[kSecUseAuthenticationContext as String] = context
+  }
+
+  if returnRef {
+    query[kSecReturnRef as String] = true
+  }
+
+  if returnAttributes {
+    query[kSecReturnAttributes as String] = true
+  }
+
+  return query
+}
+
+/**
+ * Disables authentication UI on a keychain query so lookups never prompt —
+ * an auth-gated key surfaces as errSecInteractionNotAllowed instead.
+ */
+public func applyNoInteractionContext(_ query: inout [String: Any]) {
+  if #available(iOS 16.0, *) {
+    let noUIContext = LAContext()
+    noUIContext.interactionNotAllowed = true
+    query[kSecUseAuthenticationContext as String] = noUIContext
+  } else {
+    query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+  }
+}
+
+/**
+ * Creates access control for biometric authentication
+ * - Parameters:
+ *   - keyType: The type of key being created
+ *   - allowDeviceCredentialsFallback: When true, allows passcode fallback after biometry fails or is unavailable.
+ * - Returns: SecAccessControl for biometric keys or nil if creation fails
+ */
+public func createBiometricAccessControl(
+  for keyType: BiometricKeyType = .ec256,
+  allowDeviceCredentialsFallback: Bool = false,
+  useBiometryCurrentSet: Bool = false
+) -> SecAccessControl? {
+  // Determine the authentication constraint:
+  // - .biometryAny: biometrics only, supports legacy key behavior across enrollments.
+  // - .biometryCurrentSet: biometrics only, bound to the currently enrolled set.
+  //   Any enrollment change invalidates the key and requires re-enrollment.
+  // - .userPresence: biometry first, with passcode fallback if biometry fails
+  //   or is unavailable. This cannot be tied to the current biometric set.
+  let authConstraint: SecAccessControlCreateFlags = allowDeviceCredentialsFallback
+    ? .userPresence
+    : (useBiometryCurrentSet ? .biometryCurrentSet : .biometryAny)
+
+  // For RSA keys (not in Secure Enclave), we use access control matching old Objective-C implementation
+  if keyType == .rsa2048 {
+    // Use kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly with authConstraint.
+    return SecAccessControlCreateWithFlags(
+      kCFAllocatorDefault,
+      kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+      authConstraint,
+      nil
+    )
+  } else {
+    // For EC keys (in Secure Enclave), we use privateKeyUsage
+    // On simulator, Secure Enclave is not available, so skip .privateKeyUsage
+    #if targetEnvironment(simulator)
+    let flags: SecAccessControlCreateFlags = authConstraint
+    #else
+    let flags: SecAccessControlCreateFlags = [authConstraint, .privateKeyUsage]
+    #endif
+    return SecAccessControlCreateWithFlags(
+      kCFAllocatorDefault,
+      kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+      flags,
+      nil
+    )
+  }
+}
+
+/**
+ * Biometric key type enumeration for key generation
+ */
+public enum BiometricKeyType {
+  case rsa2048
+  case ec256
+}
+
+/**
+ * Creates key generation attributes for biometric keys
+ * - Parameters:
+ *   - keyTagData: The key tag data
+ *   - accessControl: The access control for the key
+ *   - keyType: The type of key to generate (RSA or EC)
+ * - Returns: Key generation attributes dictionary
+ */
+public func createKeyGenerationAttributes(
+  keyTagData: Data,
+  accessControl: SecAccessControl,
+  keyType: BiometricKeyType = .ec256
+) -> [String: Any] {
+  switch keyType {
+  case .rsa2048:
+    // Match the old Objective-C implementation structure
+    return [
+      kSecClass as String: kSecClassKey,
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2048,
+      kSecPrivateKeyAttrs as String: [
+        kSecAttrIsPermanent as String: true,
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow,
+        kSecAttrApplicationTag as String: keyTagData,
+        kSecAttrAccessControl as String: accessControl
+      ]
+    ]
+
+  case .ec256:
+    var attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+      kSecAttrKeySizeInBits as String: 256,
+      kSecPrivateKeyAttrs as String: [
+        kSecAttrIsPermanent as String: true,
+        kSecAttrApplicationTag as String: keyTagData,
+        kSecAttrAccessControl as String: accessControl
+      ]
+    ]
+    #if !targetEnvironment(simulator)
+    attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+    #endif
+    return attributes
+  }
+}
+
+/**
+ * Creates key generation attributes for keys that do NOT require user
+ * authentication. The private key stays non-exportable and hardware-backed
+ * (Secure Enclave for EC keys on device), but using it never prompts.
+ *
+ * kSecAttrAccessibleWhenUnlockedThisDeviceOnly keeps the key device-bound
+ * without depending on a passcode being set (unlike the biometric path's
+ * WhenPasscodeSetThisDeviceOnly). Secure Enclave keys must still carry an
+ * access control, so they get one with only .privateKeyUsage — no biometry
+ * or user-presence constraint.
+ * - Returns: Key generation attributes dictionary, or nil if the required
+ *   access control could not be created
+ */
+public func createNoAuthKeyGenerationAttributes(
+  keyTagData: Data,
+  keyType: BiometricKeyType
+) -> [String: Any]? {
+  switch keyType {
+  case .rsa2048:
+    return [
+      kSecClass as String: kSecClassKey,
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2048,
+      kSecPrivateKeyAttrs as String: [
+        kSecAttrIsPermanent as String: true,
+        kSecAttrApplicationTag as String: keyTagData,
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+      ]
+    ]
+
+  case .ec256:
+    var privateKeyAttrs: [String: Any] = [
+      kSecAttrIsPermanent as String: true,
+      kSecAttrApplicationTag as String: keyTagData
+    ]
+    #if targetEnvironment(simulator)
+    privateKeyAttrs[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    #else
+    guard let accessControl = SecAccessControlCreateWithFlags(
+      kCFAllocatorDefault,
+      kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+      [.privateKeyUsage],
+      nil
+    ) else {
+      return nil
+    }
+    privateKeyAttrs[kSecAttrAccessControl as String] = accessControl
+    #endif
+
+    var attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+      kSecAttrKeySizeInBits as String: 256,
+      kSecPrivateKeyAttrs as String: privateKeyAttrs
+    ]
+    #if !targetEnvironment(simulator)
+    attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+    #endif
+    return attributes
+  }
+}
+
+/**
+ * SPKI (Subject Public Key Info) header for EC P-256 (secp256r1) keys.
+ * This ASN.1 header is required for standard X.509 SubjectPublicKeyInfo format
+ * and compatibility with the old react-native-biometrics library.
+ *
+ * Structure:
+ *   SEQUENCE {
+ *     SEQUENCE {
+ *       OID 1.2.840.10045.2.1 (ecPublicKey)
+ *       OID 1.2.840.10045.3.1.7 (secp256r1/P-256)
+ *     }
+ *     BIT STRING (containing the raw EC public key)
+ *   }
+ */
+private let ecP256SPKIHeader: [UInt8] = [
+  0x30, 0x59,       // SEQUENCE, length 89
+  0x30, 0x13,       // SEQUENCE, length 19
+  0x06, 0x07,       // OID, length 7
+  0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,  // 1.2.840.10045.2.1 (ecPublicKey)
+  0x06, 0x08,       // OID, length 8
+  0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,  // 1.2.840.10045.3.1.7 (secp256r1)
+  0x03, 0x42,       // BIT STRING, length 66
+  0x00              // unused bits = 0
+]
+
+/**
+ * Encodes an ASN.1 DER length field (short or long form).
+ */
+private func derLength(_ length: Int) -> [UInt8] {
+  if length < 0x80 {
+    return [UInt8(length)]
+  }
+  var bytes: [UInt8] = []
+  var value = length
+  while value > 0 {
+    bytes.insert(UInt8(value & 0xFF), at: 0)
+    value >>= 8
+  }
+  return [0x80 | UInt8(bytes.count)] + bytes
+}
+
+/**
+ * Exports a public key as base64 X.509 SubjectPublicKeyInfo DER for all key
+ * types. EC P-256 reuses the fixed SPKI header; RSA wraps the PKCS#1 output
+ * of SecKeyCopyExternalRepresentation in a computed SPKI envelope:
+ *   SEQUENCE {
+ *     SEQUENCE { OID 1.2.840.113549.1.1.1 (rsaEncryption), NULL }
+ *     BIT STRING { PKCS#1 RSAPublicKey }
+ *   }
+ * Once base64-decoded, the result is directly consumable by standard tooling
+ * (openssl pkey -pubin -inform DER) and matches PublicKey.getEncoded() on Android.
+ * Returns nil for key types this library does not create (non-P-256 EC, non-RSA).
+ */
+public func exportPublicKeyToSPKIBase64(_ publicKey: SecKey) -> String? {
+  var error: Unmanaged<CFError>?
+  guard let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, &error) else {
+    if let cfError = error?.takeRetainedValue() {
+      ReactNativeBiometricDebug.debugLog("Public key export error: \(cfError.localizedDescription)")
+    }
+    return nil
+  }
+
+  let rawKeyData = publicKeyData as Data
+  let keyAttributes = SecKeyCopyAttributes(publicKey) as? [String: Any] ?? [:]
+  let keyType = keyAttributes[kSecAttrKeyType as String] as? String ?? ""
+
+  if keyType == kSecAttrKeyTypeECSECPrimeRandom as String {
+    // Uncompressed P-256 point: 0x04 + 32-byte X + 32-byte Y
+    guard rawKeyData.count == 65 && rawKeyData[0] == 0x04 else {
+      ReactNativeBiometricDebug.debugLog("Public key export error: unsupported EC key (\(rawKeyData.count) bytes)")
+      return nil
+    }
+    var spkiData = Data(ecP256SPKIHeader)
+    spkiData.append(rawKeyData)
+    ReactNativeBiometricDebug.debugLog("Exported EC P-256 public key as SPKI (\(spkiData.count) bytes)")
+    return spkiData.base64EncodedString()
+  }
+
+  guard keyType == kSecAttrKeyTypeRSA as String else {
+    ReactNativeBiometricDebug.debugLog("Public key export error: unsupported key type \(keyType)")
+    return nil
+  }
+
+  let rsaAlgorithmIdentifier: [UInt8] = [
+    0x30, 0x0D,        // SEQUENCE, length 13
+    0x06, 0x09,        // OID, length 9
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,  // 1.2.840.113549.1.1.1 (rsaEncryption)
+    0x05, 0x00         // NULL
+  ]
+  var bitString: [UInt8] = [0x03]
+  bitString += derLength(rawKeyData.count + 1)
+  bitString.append(0x00)  // unused bits
+  bitString += [UInt8](rawKeyData)
+
+  var spki: [UInt8] = [0x30]
+  spki += derLength(rsaAlgorithmIdentifier.count + bitString.count)
+  spki += rsaAlgorithmIdentifier
+  spki += bitString
+
+  ReactNativeBiometricDebug.debugLog("Exported RSA public key as SPKI (\(spki.count) bytes)")
+  return Data(spki).base64EncodedString()
+}
+
+#if targetEnvironment(simulator)
+/// Derives the appropriate LAPolicy from a key's SecAccessControl.
+/// Compares the access control against known biometry-only configurations
+/// (the same split used in createBiometricAccessControl).
+///   .biometryAny/.biometryCurrentSet -> .deviceOwnerAuthenticationWithBiometrics
+///   .userPresence  -> .deviceOwnerAuthentication
+public func deriveLAPolicy(from accessControl: SecAccessControl) -> LAPolicy {
+  // On simulator, .privateKeyUsage is omitted so the flags are just the auth constraint.
+  if let currentSetRef = SecAccessControlCreateWithFlags(
+    kCFAllocatorDefault,
+    kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+    .biometryCurrentSet,
+    nil
+  ), CFEqual(accessControl, currentSetRef) {
+    return .deviceOwnerAuthenticationWithBiometrics
+  }
+  if let anyRef = SecAccessControlCreateWithFlags(
+    kCFAllocatorDefault,
+    kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+    .biometryAny,
+    nil
+  ), CFEqual(accessControl, anyRef) {
+    return .deviceOwnerAuthenticationWithBiometrics
+  }
+
+  // No biometry-only match -> key uses .userPresence (allows passcode fallback)
+  return .deviceOwnerAuthentication
+}
+#endif
+
+/**
+ * Checks if the device is jailbroken
+ * This performs multiple checks to detect jailbreak
+ */
+public func isDeviceJailbroken() -> Bool {
+  return checkJailbreakMethod1() || checkJailbreakMethod2() || checkJailbreakMethod3()
+}
+
+/**
+ * Check for common jailbreak files and directories
+ */
+private func checkJailbreakMethod1() -> Bool {
+  let jailbreakPaths = [
+    "/Applications/Cydia.app",
+    "/Library/MobileSubstrate/MobileSubstrate.dylib",
+    "/bin/bash",
+    "/usr/sbin/sshd",
+    "/etc/apt",
+    "/private/var/lib/apt/",
+    "/private/var/lib/cydia",
+    "/private/var/mobile/Library/SBSettings/Themes",
+    "/Library/MobileSubstrate/DynamicLibraries/Veency.plist",
+    "/Library/MobileSubstrate/DynamicLibraries/LiveClock.plist",
+    "/System/Library/LaunchDaemons/com.ikey.bbot.plist",
+    "/System/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist",
+    "/Applications/RockApp.app",
+    "/Applications/Icy.app",
+    "/Applications/WinterBoard.app",
+    "/Applications/SBSettings.app",
+    "/Applications/MxTube.app",
+    "/Applications/IntelliScreen.app",
+    "/Applications/FakeCarrier.app",
+    "/Applications/blackra1n.app",
+    "/usr/bin/sshd",
+    "/usr/libexec/sftp-server",
+    "/usr/libexec/ssh-keysign",
+    "/var/cache/apt",
+    "/var/lib/apt",
+    "/var/lib/cydia",
+    "/var/log/syslog",
+    "/var/tmp/cydia.log",
+    "/bin/su",
+    "/usr/bin/su",
+    "/usr/sbin/frida-server",
+    "/usr/bin/cycript",
+    "/usr/local/bin/cycript",
+    "/usr/lib/libcycript.dylib",
+    "/System/Library/LaunchDaemons/com.openssh.sshd.plist"
+  ]
+
+  for path in jailbreakPaths {
+    if FileManager.default.fileExists(atPath: path) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Check if we can write to system directories (jailbroken devices allow this)
+ */
+private func checkJailbreakMethod2() -> Bool {
+  let testString = "jailbreak_test"
+  let testPaths = [
+    "/private/jailbreak_test.txt",
+    "/private/var/mobile/jailbreak_test.txt"
+  ]
+
+  for path in testPaths {
+    do {
+      try testString.write(toFile: path, atomically: true, encoding: .utf8)
+      try FileManager.default.removeItem(atPath: path)
+      return true
+    } catch {
+      // Cannot write, continue
+    }
+  }
+  return false
+}
+
+/**
+ * Check for suspicious environment variables and system behavior
+ */
+private func checkJailbreakMethod3() -> Bool {
+  // Check for suspicious environment variables
+  if let dyldInsertLibraries = getenv("DYLD_INSERT_LIBRARIES") {
+    let libraries = String(cString: dyldInsertLibraries)
+    if libraries.contains("MobileSubstrate") || libraries.contains("cycript") {
+      return true
+    }
+  }
+
+  // Check if we can open suspicious URLs (jailbroken devices may have custom URL schemes)
+  let suspiciousURLs = [
+    "cydia://package/com.example.package",
+    "sileo://package/com.example.package",
+    "zbra://package/com.example.package"
+  ]
+
+  for urlString in suspiciousURLs {
+    if let url = URL(string: urlString) {
+      if UIApplication.shared.canOpenURL(url) {
+        return true
+      }
+    }
+  }
+
+  return false
+}
+
+/**
+ * Detects an active Frida/instrumentation session: injected libraries in
+ * DYLD_INSERT_LIBRARIES, frida images loaded into the process, or the default
+ * frida-server port listening on localhost. Best-effort heuristics: an attacker
+ * who already controls the runtime can hook these checks themselves, so treat
+ * a negative result as "nothing detected", not proof of integrity.
+ */
+public func detectFridaRuntime() -> Bool {
+  if let dyldInsertLibraries = getenv("DYLD_INSERT_LIBRARIES") {
+    let libraries = String(cString: dyldInsertLibraries).lowercased()
+    if libraries.contains("frida") || libraries.contains("substrate") || libraries.contains("cycript") {
+      return true
+    }
+  }
+
+  for i in 0..<_dyld_image_count() {
+    if let imageName = _dyld_get_image_name(i) {
+      // Match the image's file name, never its directory path, so an app
+      // legitimately named Frida (executable .../Frida.app/Frida) is not
+      // flagged. The app's own bundle is still scanned on purpose: a
+      // repackaged IPA carries FridaGadget.dylib inside it, which is the usual
+      // injection route on a non-jailbroken device.
+      let image = (String(cString: imageName) as NSString).lastPathComponent.lowercased()
+      if instrumentationImages.contains(where: { image.contains($0) }) {
+        return true
+      }
+    }
+  }
+
+  return isLocalPortOpen(27042)
+}
+
+/**
+ * Instrumentation image names, matched against the file name of a loaded image.
+ * Deliberately more specific than the framework name: a bare "frida" or
+ * "substrate" would also match an app whose own bundle or executable contains
+ * that word, and a single match forces riskLevel HIGH.
+ */
+private let instrumentationImages = [
+  "frida-agent", "frida-gadget", "fridagadget", "libfrida",
+  "cynject", "libcycript", "libsubstrate", "mobilesubstrate"
+]
+
+/**
+ * Probe a TCP port on localhost (used for the default frida-server port).
+ * A closed local port refuses immediately; the 300ms send timeout bounds the
+ * pathological case.
+ */
+private func isLocalPortOpen(_ port: UInt16) -> Bool {
+  let sock = socket(AF_INET, SOCK_STREAM, 0)
+  guard sock >= 0 else { return false }
+  defer { close(sock) }
+
+  var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+  var addr = sockaddr_in()
+  addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  addr.sin_family = sa_family_t(AF_INET)
+  addr.sin_port = in_port_t(port).bigEndian
+  addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+  let result = withUnsafePointer(to: &addr) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+      connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+  }
+  return result == 0
+}
+
+/**
+ * Checks whether a debugger is currently attached to this process (P_TRACED)
+ */
+public func isDebuggerAttached() -> Bool {
+  var info = kinfo_proc()
+  var size = MemoryLayout<kinfo_proc>.stride
+  var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+  guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0 else {
+    return false
+  }
+  return (info.kp_proc.p_flag & P_TRACED) != 0
+}
+
+/**
+ * Checks if the device is compromised (jailbroken or actively hooked)
+ */
+public func isDeviceCompromised() -> Bool {
+  return isDeviceJailbroken() || detectFridaRuntime()
+}
+
+/**
+ * Gets device integrity status.
+ * Named distinctly from the module's `getDeviceIntegrityStatus(_:rejecter:)` so
+ * the call site inside the class resolves here instead of being shadowed by the
+ * member of the same name.
+ */
+public func buildDeviceIntegrityStatus() -> [String: Any] {
+  let isJailbroken = isDeviceJailbroken()
+  let fridaDetected = detectFridaRuntime()
+
+  return [
+    "isJailbroken": isJailbroken,
+    "hasRuntimeHooks": fridaDetected,
+    // Informational only: debuggers are routine in development, so this does
+    // not feed isCompromised/riskLevel.
+    "isDebuggerAttached": isDebuggerAttached(),
+    "runtimeHookDetails": ["fridaDetected": fridaDetected],
+    "isCompromised": isJailbroken || fridaDetected,
+    "riskLevel": (isJailbroken || fridaDetected) ? "HIGH" : "NONE"
+  ]
+}
